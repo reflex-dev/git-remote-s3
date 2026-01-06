@@ -31,7 +31,7 @@ from .common import parse_git_url
 from .enums import UriScheme
 
 # Incremental bundle configuration
-DEFAULT_CHECKPOINT_INTERVAL = 20
+DEFAULT_CHECKPOINT_INTERVAL = 30
 
 logger = logging.getLogger(__name__)
 if "remote" in __name__:
@@ -116,14 +116,6 @@ class S3Remote:
             )
         except ValueError:
             self.checkpoint_interval = DEFAULT_CHECKPOINT_INTERVAL
-
-        self.incremental_enabled = os.environ.get(
-            "GIT_REMOTE_S3_INCREMENTAL", "true"
-        ).lower() in (
-            "1",
-            "true",
-            "yes",
-        )
 
     def get_manifest(self, ref: str) -> Optional[dict]:
         """Get manifest for a ref, or None if not found."""
@@ -212,7 +204,7 @@ class S3Remote:
                     git.unbundle(bundle_path=local_path, ref=ref)
                     os.remove(local_path)
             else:
-                # Legacy single bundle fetch
+                # No manifest file - download single bundle
                 bundle_path = f"{temp_dir}/{sha}.bundle"
                 self.s3.download_file(
                     Bucket=self.bucket,
@@ -296,7 +288,7 @@ class S3Remote:
             # Check for incremental mode
             manifest = (
                 self.get_manifest(remote_ref)
-                if self.incremental_enabled and not force_push
+                if self.checkpoint_interval != 1 and not force_push
                 else None
             )
 
@@ -360,7 +352,7 @@ class S3Remote:
                     self.s3.put_object(Bucket=self.bucket, Key=bundle_key, Body=f)
 
                 # Create manifest for future incremental pushes
-                if self.incremental_enabled and not force_push:
+                if self.checkpoint_interval != 1 and not force_push:
                     manifest = {
                         "version": 1,
                         "checkpoint": {"sha": sha, "key": bundle_key},
@@ -449,6 +441,7 @@ class S3Remote:
             and ".zip" not in c["Key"]
             and "/LOCKS/" not in c["Key"]
             and not c["Key"].endswith(".lock")
+            and not c["Key"].endswith("manifest.json")
         ]
 
     def is_protected(self, remote_ref):
