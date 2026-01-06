@@ -539,8 +539,8 @@ class S3Remote:
                 for o in objs:
                     ref = "/".join(o.split("/")[:-1])
                     if ref == head:
-                        logger.info(f"@{ref} HEAD\n")
                         sys.stdout.write(f"@{ref} HEAD\n")
+                        break
             except ClientError as e:
                 if e.response["Error"]["Code"] == "NoSuchKey":
                     pass  # ignoring missing HEAD on remote
