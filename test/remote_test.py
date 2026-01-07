@@ -362,6 +362,9 @@ def test_cmd_push_force_no_ancestor(
     session_client_mock.return_value.list_objects_v2.side_effect = (
         create_list_objects_v2_mock(shas=[SHA2])
     )
+    session_client_mock.return_value.get_object.side_effect = (
+        create_get_object_no_manifest_mock()
+    )
     is_ancestor_mock.return_value = False
     assert s3_remote.s3 == session_client_mock.return_value
     res = s3_remote.cmd_push(f"push +refs/heads/{BRANCH}:refs/heads/{BRANCH}")
@@ -370,7 +373,7 @@ def test_cmd_push_force_no_ancestor(
         for c in session_client_mock.return_value.put_object.call_args_list
         if not c.kwargs["Key"].endswith(".lock")
     ]
-    assert len(put_calls) == 1
+    assert len(put_calls) == 2  # bundle + manifest
     del_calls = [
         c
         for c in session_client_mock.return_value.delete_object.call_args_list
@@ -406,6 +409,9 @@ def test_cmd_push_force_no_ancestor_s3_zip(
     session_client_mock.return_value.list_objects_v2.side_effect = (
         create_list_objects_v2_mock(shas=[SHA2])
     )
+    session_client_mock.return_value.get_object.side_effect = (
+        create_get_object_no_manifest_mock()
+    )
 
     is_ancestor_mock.return_value = False
 
@@ -417,7 +423,7 @@ def test_cmd_push_force_no_ancestor_s3_zip(
         for c in session_client_mock.return_value.put_object.call_args_list
         if not c.kwargs["Key"].endswith(".lock")
     ]
-    assert len(put_calls) == 2
+    assert len(put_calls) == 3  # bundle + manifest + zip
     del_calls = [
         c
         for c in session_client_mock.return_value.delete_object.call_args_list
@@ -1359,7 +1365,7 @@ def test_cmd_push_legacy_to_incremental_transition(
 def test_cmd_push_force_push_resets_manifest(
     session_client_mock, bundle_mock, rev_parse_mock, is_ancestor_mock
 ):
-    """Force push creates new manifest, ignoring existing one."""
+    """Force push creates new manifest and cleans up old manifest's bundles."""
     s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
     rev_parse_mock.return_value = SHA2
     is_ancestor_mock.return_value = False  # Not a fast-forward
@@ -1370,15 +1376,15 @@ def test_cmd_push_force_push_resets_manifest(
         f.write(MOCK_BUNDLE_CONTENT)
     bundle_mock.return_value = temp_file.name
 
-    # Existing manifest - should be ignored on force push
+    # Existing manifest with checkpoint and chain - should be cleaned up on force push
     existing_manifest = create_manifest(
         SHA1,
         f"test_prefix/refs/heads/{BRANCH}/{SHA1}.bundle",
         chain=[
             {
                 "from": SHA1,
-                "to": "aaa",
-                "key": f"test_prefix/refs/heads/{BRANCH}/aaa.bundle",
+                "to": "a" * 40,
+                "key": f"test_prefix/refs/heads/{BRANCH}/{'a' * 40}.bundle",
             }
         ],
     )
@@ -1401,6 +1407,10 @@ def test_cmd_push_force_push_resets_manifest(
                     "Key": f"test_prefix/refs/heads/{BRANCH}/{SHA1}.bundle",
                     "LastModified": datetime.datetime.now(),
                 },
+                {
+                    "Key": f"test_prefix/refs/heads/{BRANCH}/{'a' * 40}.bundle",
+                    "LastModified": datetime.datetime.now(),
+                },
             ],
             "NextContinuationToken": None,
         }
@@ -1419,8 +1429,7 @@ def test_cmd_push_force_push_resets_manifest(
     call_kwargs = bundle_mock.call_args.kwargs
     assert call_kwargs.get("basis") is None
 
-    # Force push should upload bundle but NOT create manifest
-    # (manifest is only created for non-force pushes to enable future incremental pushes)
+    # Force push should upload bundle AND create new manifest
     put_calls = [
         c
         for c in session_client_mock.return_value.put_object.call_args_list
@@ -1430,7 +1439,27 @@ def test_cmd_push_force_push_resets_manifest(
     manifest_calls = [c for c in put_calls if c.kwargs["Key"].endswith("manifest.json")]
 
     assert len(bundle_calls) == 1  # Bundle uploaded
-    assert len(manifest_calls) == 0  # No manifest on force push
+    assert len(manifest_calls) == 1  # New manifest created
+
+    # Verify new manifest has correct content
+    manifest_body = manifest_calls[0].kwargs["Body"]
+    manifest = json.loads(manifest_body.decode("utf-8"))
+    assert manifest["checkpoint"]["sha"] == SHA2
+    assert manifest["chain"] == []
+
+    # Verify old bundles and manifest were cleaned up (no duplicates)
+    del_calls = [
+        c
+        for c in session_client_mock.return_value.delete_object.call_args_list
+        if not c.kwargs["Key"].endswith(".lock")
+    ]
+    deleted_keys = [c.kwargs["Key"] for c in del_calls]
+    # Should delete: old checkpoint bundle (SHA1), manifest, and chain bundle (aaa...)
+    assert f"test_prefix/refs/heads/{BRANCH}/{SHA1}.bundle" in deleted_keys
+    assert f"test_prefix/refs/heads/{BRANCH}/manifest.json" in deleted_keys
+    assert f"test_prefix/refs/heads/{BRANCH}/{'a' * 40}.bundle" in deleted_keys
+    # Verify no duplicate deletions
+    assert len(deleted_keys) == 3
 
 
 @patch("git_remote_s3.git.is_ancestor")

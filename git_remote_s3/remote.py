@@ -269,7 +269,7 @@ class S3Remote:
 
         sha: Optional[str] = None
         lock_key: Optional[str] = None
-        bundles_to_cleanup: list[str] = []
+        files_to_cleanup: list[str] = []
 
         try:
             sha = git.rev_parse(local_ref)
@@ -305,7 +305,7 @@ class S3Remote:
                 if chain_len >= self.checkpoint_interval:
                     # Create new checkpoint
                     logger.info(f"Creating checkpoint (chain length: {chain_len})")
-                    bundles_to_cleanup = [manifest["checkpoint"]["key"]] + [
+                    files_to_cleanup = [manifest["checkpoint"]["key"]] + [
                         e["key"] for e in manifest["chain"]
                     ]
                     temp_file = git.bundle(folder=temp_dir, sha=sha, ref=local_ref)
@@ -333,17 +333,29 @@ class S3Remote:
                 self.put_manifest(remote_ref, manifest)
 
             else:
-                # Legacy or first push - check for existing bundles
-                contents = self.get_bundles_for_ref(remote_ref)
-                if len(contents) > 1:
-                    return f'error {remote_ref} "multiple bundles exists on server. Run git-s3 doctor to fix."?\n'
+                # Legacy, first push, or force push
+                if force_push:
+                    # Force push: clean up old manifest and its bundles if exists
+                    files_to_cleanup = [
+                        c["Key"] for c in self.get_bundles_for_ref(remote_ref)
+                    ]
+                    if self.get_manifest(remote_ref):
+                        files_to_cleanup.append(
+                            f"{self.prefix}/{remote_ref}/manifest.json"
+                        )
+                else:
+                    # Non-force push: check for existing bundles
+                    bundles = self.get_bundles_for_ref(remote_ref)
 
-                remote_to_remove = contents[0]["Key"] if contents else None
-                if remote_to_remove:
-                    remote_sha = remote_to_remove.split("/")[-1].split(".")[0]
-                    if not force_push and not git.is_ancestor(remote_sha, sha):
-                        return f'error {remote_ref} "remote ref is not ancestor of {local_ref}."?\n'
-                    bundles_to_cleanup = [remote_to_remove]
+                    if len(bundles) > 1:
+                        return f'error {remote_ref} "multiple bundles exists on server. Run git-s3 doctor to fix."?\n'
+
+                    if bundles:
+                        remote_to_remove = bundles[0]["Key"]
+                        remote_sha = remote_to_remove.split("/")[-1].split(".")[0]
+                        if not git.is_ancestor(remote_sha, sha):
+                            return f'error {remote_ref} "remote ref is not ancestor of {local_ref}."?\n'
+                        files_to_cleanup = [remote_to_remove]
 
                 temp_file = git.bundle(folder=temp_dir, sha=sha, ref=local_ref)
                 bundle_key = f"{self.prefix}/{remote_ref}/{sha}.bundle"
@@ -352,7 +364,7 @@ class S3Remote:
                     self.s3.put_object(Bucket=self.bucket, Key=bundle_key, Body=f)
 
                 # Create manifest for future incremental pushes
-                if self.checkpoint_interval != 1 and not force_push:
+                if self.checkpoint_interval != 1:
                     manifest = {
                         "version": 1,
                         "checkpoint": {"sha": sha, "key": bundle_key},
@@ -363,8 +375,8 @@ class S3Remote:
             self.init_remote_head(remote_ref)
             logger.info(f"pushed {temp_file} to {remote_ref}")
 
-            # Cleanup old bundles
-            for key in bundles_to_cleanup:
+            # Cleanup old files
+            for key in files_to_cleanup:
                 try:
                     self.s3.delete_object(Bucket=self.bucket, Key=key)
                 except Exception as e:
