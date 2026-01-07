@@ -2,9 +2,9 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import re
 import subprocess
 import sys
-import re
 
 
 class GitError(Exception):
@@ -36,20 +36,25 @@ def archive(*, folder: str, ref: str) -> str:
         raise GitError(result.stderr.decode("utf8"))
 
 
-def bundle(*, folder: str, sha: str, ref: str) -> str:
+def bundle(*, folder: str, sha: str, ref: str, basis: str = None) -> str:
     """Bundles the content of the folder into a sha.bundle file
 
     Args:
         folder (str): the folder to bundle
         sha (str): the sha of the bundle. A bundle is stored as sha.bundle
         ref (str): the ref to bundle
+        basis (str): optional basis sha - if provided, creates incremental bundle
+                     excluding commits reachable from basis
 
     Returns:
         str: the path to the bundle file
     """
     file_path = f"{folder}/{sha}.bundle"
+    cmd = ["git", "bundle", "create", file_path, ref]
+    if basis:
+        cmd.append(f"^{basis}")
     result = subprocess.run(
-        ["git", "bundle", "create", file_path, ref],
+        cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=True,
@@ -61,16 +66,15 @@ def bundle(*, folder: str, sha: str, ref: str) -> str:
         raise GitError(result.stderr.decode("utf8"))
 
 
-def unbundle(*, folder: str, sha: str, ref: str):
-    """Unbundles the content of the bundle referred by the sha
+def unbundle(*, bundle_path: str, ref: str):
+    """Unbundles a bundle file.
 
     Args:
-        folder (str): the folder where the bundle is located
-        sha (str): the sha of the bundle. A bundle is stored as sha.bundle
+        bundle_path (str): full path to the bundle file
         ref (str): the ref to checkout after unbundling
     """
     subprocess.run(
-        ["git", "bundle", "unbundle", f"{folder}/{sha}.bundle", ref],
+        ["git", "bundle", "unbundle", bundle_path, ref],
         stdout=sys.stderr,
         check=True,
     )

@@ -1,8 +1,38 @@
 from mock import patch
 from io import BytesIO
 from git_remote_s3 import S3Remote, UriScheme
+from botocore.exceptions import ClientError
 
 import threading
+
+
+import os
+
+
+def create_get_object_no_manifest_mock(branch="pytest"):
+    """Mock get_object that returns NoSuchKey for manifest (legacy mode)."""
+
+    def get_object_side_effect(Bucket, Key):
+        if Key.endswith("manifest.json"):
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "get_object")
+        if Key.endswith("/HEAD"):
+            return {"Body": BytesIO(f"refs/heads/{branch}".encode("utf-8"))}
+        raise ClientError({"Error": {"Code": "NoSuchKey"}}, "get_object")
+
+    return get_object_side_effect
+
+
+def create_download_file_mock():
+    """Mock download_file that creates actual files."""
+
+    def download_file_side_effect(Bucket, Key, Filename, **kwargs):
+        # Create the directory if it doesn't exist
+        os.makedirs(os.path.dirname(Filename), exist_ok=True)
+        # Create a dummy file
+        with open(Filename, "wb") as f:
+            f.write(b"MOCK_BUNDLE_CONTENT")
+
+    return download_file_side_effect
 
 SHA1 = "c105d19ba64965d2c9d3d3246e7269059ef8bb8a"
 SHA2 = "c105d19ba64965d2c9d3d3246e7269059ef8bb8b"
@@ -28,9 +58,12 @@ def test_process_fetch_cmds_empty_list(session_client_mock):
 def test_process_fetch_cmds_single_command(session_client_mock, unbundle_mock):
     """Test processing a single fetch command"""
     s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-    session_client_mock.return_value.get_object.return_value = {
-        "Body": BytesIO(MOCK_BUNDLE_CONTENT)
-    }
+    session_client_mock.return_value.get_object.side_effect = (
+        create_get_object_no_manifest_mock()
+    )
+    session_client_mock.return_value.download_file.side_effect = (
+        create_download_file_mock()
+    )
 
     # Process a single fetch command
     s3_remote.process_fetch_cmds([f"fetch {SHA1} refs/heads/{BRANCH}"])
@@ -48,9 +81,12 @@ def test_process_fetch_cmds_single_command(session_client_mock, unbundle_mock):
 def test_process_fetch_cmds_multiple_commands(session_client_mock, unbundle_mock):
     """Test processing multiple fetch commands in parallel"""
     s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-    session_client_mock.return_value.get_object.return_value = {
-        "Body": BytesIO(MOCK_BUNDLE_CONTENT)
-    }
+    session_client_mock.return_value.get_object.side_effect = (
+        create_get_object_no_manifest_mock()
+    )
+    session_client_mock.return_value.download_file.side_effect = (
+        create_download_file_mock()
+    )
 
     # Process multiple fetch commands
     fetch_cmds = [
@@ -78,9 +114,12 @@ def test_process_fetch_cmds_uses_thread_pool(session_client_mock, unbundle_mock)
     # multiple commands are processed in parallel
 
     s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-    session_client_mock.return_value.get_object.return_value = {
-        "Body": BytesIO(MOCK_BUNDLE_CONTENT)
-    }
+    session_client_mock.return_value.get_object.side_effect = (
+        create_get_object_no_manifest_mock()
+    )
+    session_client_mock.return_value.download_file.side_effect = (
+        create_download_file_mock()
+    )
 
     # Create fetch commands
     fetch_cmds = [
@@ -138,9 +177,12 @@ def test_process_cmd_batch_processing(session_client_mock, unbundle_mock, stdin_
 def test_thread_safety_of_fetched_refs(session_client_mock, unbundle_mock):
     """Test thread safety of the fetched_refs list using a real thread pool"""
     s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-    session_client_mock.return_value.get_object.return_value = {
-        "Body": BytesIO(MOCK_BUNDLE_CONTENT)
-    }
+    session_client_mock.return_value.get_object.side_effect = (
+        create_get_object_no_manifest_mock()
+    )
+    session_client_mock.return_value.download_file.side_effect = (
+        create_download_file_mock()
+    )
 
     # Create multiple fetch commands with different SHAs
     fetch_cmds = [f"fetch {SHA1} refs/heads/{BRANCH}"] * 20
@@ -157,9 +199,12 @@ def test_thread_safety_of_fetched_refs(session_client_mock, unbundle_mock):
 def test_cmd_fetch_thread_safety(session_client_mock, unbundle_mock):
     """Test that cmd_fetch is thread-safe when called concurrently"""
     s3_remote = S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix")
-    session_client_mock.return_value.get_object.return_value = {
-        "Body": BytesIO(MOCK_BUNDLE_CONTENT)
-    }
+    session_client_mock.return_value.get_object.side_effect = (
+        create_get_object_no_manifest_mock()
+    )
+    session_client_mock.return_value.download_file.side_effect = (
+        create_download_file_mock()
+    )
 
     # Create a function that simulates concurrent access
     def concurrent_fetch():
