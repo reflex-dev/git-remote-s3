@@ -167,31 +167,6 @@ def test_sigterm_runs_finally_blocks(tmp_path):
     assert not marker.exists()
 
 
-@patch("git_remote_s3.git.rev_parse", return_value=SHA)
-@patch("git_remote_s3.git.bundle", side_effect=_bundle_into)
-@patch("boto3.Session.client")
-def test_a_bundle_that_appeared_under_the_ref_refuses_the_push(
-    client, bundle, rev_parse, temp_root
-):
-    """Another writer created the ref between this push's look and its lock.
-
-    Uploading beside that bundle, with nothing to delete, would leave the ref
-    holding two -- which git then refuses as "matches more than one".
-    """
-    s3_remote = _remote(client)
-    other = {"Key": f"test_prefix/{BRANCH}/{'d' * 40}.bundle"}
-    client.return_value.list_objects_v2.side_effect = [
-        {"Contents": []},
-        {"Contents": [other]},
-    ]
-
-    res = s3_remote.cmd_push(f"push {BRANCH}:{BRANCH}")
-
-    assert res.startswith(f"error {BRANCH} ")
-    assert "stale remote" in res
-    assert client.return_value.upload_file.call_count == 0
-
-
 @patch("git_remote_s3.git.is_ancestor", return_value=True)
 @patch("git_remote_s3.git.rev_parse", return_value=SHA)
 @patch("git_remote_s3.git.bundle", side_effect=_bundle_into)

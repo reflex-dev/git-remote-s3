@@ -304,10 +304,6 @@ class S3Remote:
             current_remote_to_remove = (
                 current_contents[0]["Key"] if len(current_contents) == 1 else None
             )
-            # Compared whole, None included: a ref that had no bundle when this
-            # push looked, and has one now, was created by another writer, and
-            # uploading beside it -- with nothing to delete -- leaves the ref
-            # holding two bundles, which every later push and fetch refuses.
             if current_remote_to_remove != remote_to_remove:
                 return f'error {remote_ref} "stale remote. Please fetch and retry."?\n'
 
