@@ -359,14 +359,9 @@ class S3Remote:
         """
 
         lock_key = f"{self.prefix}/{remote_ref}/LOCK#.lock"
-        # Identifies our PUT so a 412 caused by boto3 retrying our own
-        # successful write can be recognised and claimed. Set
-        # GIT_REMOTE_S3_OWNER_TOKEN to a stable per-client value to also
-        # recover locks leaked by a previous invocation of this helper.
-        token = (
-            os.environ.get("GIT_REMOTE_S3_OWNER_TOKEN", "").encode()
-            or uuid.uuid4().hex.encode()
-        )
+        # Unique per acquisition, so a 412 caused by boto3 retrying our own
+        # successful PUT can be told apart from another client's lock.
+        token = uuid.uuid4().hex.encode()
         try:
             # Use conditional write to create the lock only if it does not exist
             self.s3.put_object(
@@ -385,35 +380,33 @@ class S3Remote:
                     "412",
                 ]
             ):
-                # Take the existing lock if it's ours (boto3 retried our own
-                # successful PUT, or an outer-loop retry of this helper) or stale.
                 try:
+                    try:
+                        obj = self.s3.get_object(Bucket=self.bucket, Key=lock_key)
+                        if obj["Body"].read() == token:
+                            # boto3 retried our own PUT, which already succeeded.
+                            return lock_key
+                    except botocore.exceptions.ClientError:
+                        pass
+                    # Check if the existing lock is stale; if so, try to clear and acquire
                     head = self.s3.head_object(Bucket=self.bucket, Key=lock_key)
-                    is_stale = False
                     last_modified = head.get("LastModified")
                     if last_modified is not None:
                         import datetime
 
                         now = datetime.datetime.now(tz=last_modified.tzinfo)
                         age = (now - last_modified).total_seconds()
-                        is_stale = age > self.lock_ttl_seconds
-                    is_ours = False
-                    try:
-                        obj = self.s3.get_object(Bucket=self.bucket, Key=lock_key)
-                        is_ours = obj["Body"].read() == token
-                    except botocore.exceptions.ClientError:
-                        pass
-                    if is_ours or is_stale:
-                        # Attempt to delete and re-acquire
-                        self.s3.delete_object(Bucket=self.bucket, Key=lock_key)
-                        # Retry conditional put
-                        self.s3.put_object(
-                            Bucket=self.bucket,
-                            Key=lock_key,
-                            Body=token,
-                            IfNoneMatch="*",
-                        )
-                        return lock_key
+                        if age > self.lock_ttl_seconds:
+                            # Attempt to delete stale lock and re-acquire
+                            self.s3.delete_object(Bucket=self.bucket, Key=lock_key)
+                            # Retry conditional put
+                            self.s3.put_object(
+                                Bucket=self.bucket,
+                                Key=lock_key,
+                                Body=token,
+                                IfNoneMatch="*",
+                            )
+                            return lock_key
                 except botocore.exceptions.ClientError as e:
                     logger.info(f"failed to check staleness of {lock_key} for {remote_ref}: {e}")
                     raise e
