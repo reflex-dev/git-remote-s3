@@ -230,18 +230,42 @@ Visit [Tutorial: Create a simple pipeline (S3 bucket)](https://docs.aws.amazon.c
 
 To use LFS you need to first install git-lfs. You can refer to the [official documentation](https://git-lfs.com/) on how to do this on your system.
 
-Next, you need enable the S3 integration by running the following command in the repo folder:
+Next, enable the S3 integration in the repo. There are two install modes:
 
 ```bash
+# Per-remote (recommended; required when other LFS remotes coexist)
+git-lfs-s3 install --remote <remote-name>
+
+# Unscoped (back-compat; applies the agent to ALL remotes in the repo)
 git-lfs-s3 install
 ```
 
-which is a short cut for:
+`--remote` writes a per-remote scoped configuration so `git-lfs-s3` only fires for that one remote — letting an S3 remote coexist with non-S3 LFS remotes (e.g. GitHub, GitLab) without breaking their LFS push/pull. Use it whenever the repo has more than one remote.
+
+The bare `git-lfs-s3 install` form sets `lfs.standalonetransferagent` globally and is short for:
 
 ```bash
 git config --add lfs.customtransfer.git-lfs-s3.path git-lfs-s3
 git config --add lfs.standalonetransferagent git-lfs-s3
 ```
+
+`git-lfs-s3 install --remote <name>` instead writes:
+
+```bash
+git config remote.<name>.lfsurl https://lfs-alias.git-remote-s3.test/<bucket>/<prefix>
+git config lfs.<that-url>.standalonetransferagent git-lfs-s3
+git config lfs.customtransfer.git-lfs-s3.path git-lfs-s3
+```
+
+The `lfs-alias.git-remote-s3.test` host is a synthetic, never-contacted match key (the `.test` TLD is reserved by RFC 6761 for non-resolvable use). It exists only because git-lfs's URL parser does not natively understand `s3://` URLs and would otherwise fall back to SSH-style endpoint discovery; setting `remote.<name>.lfsurl` short-circuits that path and gives the scoped agent lookup a stable URL to match against.
+
+`lfs.customtransfer.git-lfs-s3.path` is necessarily repo-wide (git-lfs registers transfer adapters globally, not per URL), so `git-lfs-s3` is still listed in the `transfers` array of batch requests sent to other LFS servers. If a server rejects requests naming unknown adapters, set:
+
+```bash
+git config lfs.basictransfersonly true
+```
+
+which makes git-lfs omit the `transfers` array entirely. This setting is repo-wide and limits other remotes to basic HTTPS transfers; GitHub-style hosts already use these (even over SSH remotes), so only the rare server that speaks exclusively the pure-SSH LFS protocol is affected.
 
 ### Creating the repo and pushing
 
@@ -252,13 +276,13 @@ mkdir lfs-repo
 cd lfs-repo
 git init
 git lfs install
-git-lfs-s3 install
+git remote add origin s3://my-git-bucket/lfs-repo
+git-lfs-s3 install --remote origin
 git lfs track "*.tiff"
 git add .gitattributes
 <put file.tiff in the repo>
 git add file.tiff
 git commit -a -m "my first tiff file"
-git remote add origin s3://my-git-bucket/lfs-repo
 git push --set-upstream origin main
 ```
 
@@ -278,7 +302,7 @@ To fix:
 
 ```bash
 cd lfs-repo-clone
-git-lfs-s3 install
+git-lfs-s3 install --remote origin
 git reset --hard main
 ```
 
@@ -302,73 +326,35 @@ origin  s3://my-git-bucket/this-is-a-new-repo (push)
 
 **Tip**: This behavior can be used to quickly create a new git repo.
 
-`git-remote-s3` implements **per-reference locking** to prevent concurrent write conflicts when multiple clients push to the same branch simultaneously.
-
-
-When pushing to a remote reference, `git-remote-s3` uses S3 conditional writes to acquire an exclusive lock for that specific reference:
-
-1. **Lock acquisition**: A lock file is created at `<prefix>/<ref>/LOCK#.lock` using S3's `IfNoneMatch="*"` condition, ensuring only one client can acquire the lock at a time
-2. **Push execution**: While holding the lock, the client safely uploads the new bundle and cleans up the previous one
-3. **Lock release**: The lock is automatically released after the push completes
-
-#### Concurrent push behavior
-
-If multiple clients attempt to push to the same reference simultaneously:
-
-- Only one client will successfully acquire the lock and proceed with the push
-- Other clients will receive a clear error message indicating lock acquisition failed
-- The failed clients can retry their push after the lock is released
-
-Example error message when lock acquisition fails:
-
-```
-error refs/heads/main "failed to acquire ref lock at my-repo/refs/heads/main/LOCK#.lock. 
-Another client may be pushing. If this persists beyond 60s, 
-run git-remote-s3 doctor --lock-ttl 60 to inspect and optionally clear stale locks."
-```
-
-#### Lock timeout and cleanup
-
-- **Lock TTL**: Locks automatically expire after 60 seconds by default (configurable via `GIT_REMOTE_S3_LOCK_TTL` environment variable)
-- **Stale lock detection**: If a lock becomes stale (older than the TTL), it can be automatically replaced during lock acquisition
-- **Manual cleanup**: Use `git-remote-s3 doctor <s3-uri> --lock-ttl <seconds>` to inspect and optionally clean up stale locks
-
-This locking mechanism eliminates the race conditions that could previously result in multiple bundles per reference, ensuring consistent repository state across concurrent operations.
-
-
 ### Concurrent writes
 
-Due to the distributed nature of `git`, there might be cases (albeit rare) where 2 or more `git push` are executed at the same time by different user with their own modification of the same branch. `git-remote-s3` implements **per-reference locking** to prevent concurrent write conflicts in those cases.
+Two clients can attempt to push different commits based on the same branch head at the same time. `git-remote-s3` uses per-reference locking and validates the remote state while holding the lock to prevent both writes from succeeding.
 
 #### Per-reference locking
-The git command executes the push in 4 steps:
 
-1. first it checks if the remote reference is the correct ancestor for the commit being pushed
-2. if that is correct it invokes the `git-remote-s3` command then attempts acquire a lock by creating the lock object `<prefix>/<ref>/LOCK#.lock` using S3 conditional writes.
-3. while holding the lock, `git-remote-s3` safely writes the bundle to the S3 bucket at the `refs/heads/<branch>` path
-4. `git-remote-s3` deletes the lock object after the push succeeds, thereby releasing the lock for that ref
+Each push proceeds as follows:
 
-Clients that fail to acquire the lock will fail with the following error and can try to push again.
+1. It reads the current bundle for the remote ref and verifies that it is an ancestor of the commit being pushed, unless this is an allowed force push.
+2. It creates the bundle locally, then attempts to acquire `<prefix>/<ref>/LOCK#.lock` with the S3 `IfNoneMatch="*"` condition.
+3. After acquiring the lock, it reads the remote ref again. If another push changed it since step 1, the push fails with `stale remote. Please fetch and retry.` without uploading its bundle.
+4. Otherwise, it uploads the new bundle, removes the previous bundle, and releases the lock.
 
-```
-error refs/heads/main "failed to acquire ref lock at my-repo/refs/heads/main/LOCK#.lock. 
-Another client may be pushing. If this persists beyond 60s, 
-run git-remote-s3 doctor --lock-ttl 60 to inspect and optionally clear stale locks."
-```
+The lock is scoped to one ref, so pushes to different branches do not block each other. Of two concurrent pushes to the same ref, one succeeds; the other either fails to acquire the active lock or, if it acquires the lock after the first push finishes, fails the remote-state validation. The failed client must fetch and retry its push.
 
-The per-reference locks automatically expire after 60 seconds by default. This TTL is configurable via `GIT_REMOTE_S3_LOCK_TTL` environment variable
-If for some reason a reference's lock becomes stale, `git-remote-s3` automatically clears it when executing a git push.
-If you repeatedly run into lock acquisition failures or otherwise want to manually clean up stale locks, run `git-remote-s3 doctor <s3-uri> --lock-ttl <seconds>` to inspect and optionally remove those stale locks.
+Locks are considered stale after 60 seconds by default. Configure this threshold with the `GIT_REMOTE_S3_LOCK_TTL_SECONDS` environment variable. A push that encounters a stale lock deletes it and retries lock acquisition.
+
+To inspect stale locks manually, run `git-s3 doctor <remote> --lock-ttl <seconds>`. Add `--delete-stale-locks` to delete the locks it finds.
 
 #### Multiple branch heads
-In the (rare) case where multiple `git push` commands are simultaneously executed with one or more clients running an outdated version of `git-remote-s3` without locking proection, then it is possible that that multiple bundles will be written to S3 for the same branch head. All subsequent `git push` commands will fail with the following error:
+
+If one or more clients use an outdated version of `git-remote-s3` without locking protection, simultaneous pushes can still write multiple bundles for the same branch head. All subsequent pushes will fail with the following error:
 
 ```
 error: dst refspec refs/heads/<branch>> matches more than one
 error: failed to push some refs to 's3://<bucket>/<prefix>'
 ```
 
-To fix this issue, run the `git-remote-s3 doctor <s3-uri>` command. By default it will create a new branch for every bundle that should not be retained. The user can then checkout the branch locally and merge it to the original branch. If you want instead to remove the bundle, specify `--delete-bundle`.
+To fix this issue, run `git-s3 doctor <remote>`. By default it creates a new branch for every bundle that is not retained. You can then check out those branches locally and merge them into the original branch. To remove the extra bundles instead, specify `--delete-bundle`.
 
 ## Manage the Amazon S3 remote
 
@@ -390,10 +376,7 @@ When listing remote ref (eg explicitly via `git ls-remote`) we list all the keys
 
 When pushing a new ref (eg a commit), we get the sha of the ref, we bundle the ref via `git bundle create <sha>.bundle <ref>` and store it to S3 according the schema above.
 
-If the push is successful, the code removes the previous bundle associated to the ref.
-
-If two user concurrently push a commit based on the same current branch head to the remote both bundles would be written to the repo and the current bundle removed. No data is lost, but no further push will be possible until all bundles but one are removed.
-For this you can use the `git s3 doctor <remote>` command.
+While holding the per-reference lock, the code verifies that the remote bundle has not changed, uploads the new bundle, and removes the previous bundle. A concurrent push based on a stale remote state is rejected without uploading its bundle. See [Concurrent writes](#concurrent-writes) for details.
 
 ### How LFS work
 
