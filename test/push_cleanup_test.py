@@ -313,14 +313,22 @@ def test_a_sigterm_between_the_upload_and_the_deferral_still_replaces_the_old_bu
 def test_a_lock_created_as_the_signal_landed_is_released(
     client, bundle, rev_parse, temp_root
 ):
+    """The lock PUT landed; the signal arrived as its response came back."""
     s3_remote = _remote(client)
-    client.return_value.get_object.return_value = {
-        "Body": io.BytesIO(s3_remote.lock_token)
+    stored = {}
+
+    def put_object(Bucket, Key, Body=None, **kwargs):
+        if Key.endswith("LOCK#.lock"):
+            stored[Key] = Body
+            raise Terminated()
+
+    client.return_value.put_object.side_effect = put_object
+    client.return_value.get_object.side_effect = lambda Bucket, Key: {
+        "Body": io.BytesIO(stored[Key])
     }
 
-    with patch.object(s3_remote, "acquire_lock", side_effect=Terminated()):
-        with pytest.raises(Terminated):
-            s3_remote.cmd_push(f"push {BRANCH}:{BRANCH}")
+    with pytest.raises(Terminated):
+        s3_remote.cmd_push(f"push {BRANCH}:{BRANCH}")
 
     released = [
         c.kwargs["Key"]
@@ -335,6 +343,7 @@ def test_a_lock_created_as_the_signal_landed_is_released(
 @patch("boto3.Session.client")
 def test_another_writers_lock_is_not_released(client, bundle, rev_parse, temp_root):
     s3_remote = _remote(client)
+    s3_remote.acquiring_lock_token = b"mine"
     client.return_value.get_object.return_value = {"Body": io.BytesIO(b"someone else")}
 
     with patch.object(s3_remote, "acquire_lock", side_effect=Terminated()):
