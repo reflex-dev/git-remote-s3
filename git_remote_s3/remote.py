@@ -108,19 +108,23 @@ def _raise_terminated(signum, frame):
 def termination_deferred():
     """Hold a SIGTERM until the block finishes, then raise it.
 
-    For the steps after a new bundle has landed: stopping between the upload
-    and the old bundle's delete leaves the ref holding both, and every later
-    push and fetch refuses it as "matches more than one". Both are single
-    requests, so finishing them costs the caller little of what it gave up.
+    For steps that must not stop halfway: replacing the old bundle once the
+    new one has landed (stopping between the two leaves the ref holding both,
+    which every later push and fetch refuses as "matches more than one"), and
+    a push's own cleanup (stopping there leaves its lock on the server). Each
+    is a few requests, so finishing them costs the caller little of what it
+    gave up. Nests: only the outermost block raises.
     """
+    outermost = not _Termination.deferred
     _Termination.deferred = True
     try:
         yield
     finally:
-        _Termination.deferred = False
-        if _Termination.pending:
-            _Termination.pending = False
-            raise Terminated()
+        if outermost:
+            _Termination.deferred = False
+            if _Termination.pending:
+                _Termination.pending = False
+                raise Terminated()
 
 
 @contextlib.contextmanager
@@ -413,18 +417,20 @@ class S3Remote:
             unwinding = True
             raise
         finally:
-            # First, so a lock release that fails below cannot skip it.
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            if lock_key:
-                try:
-                    self.release_lock(remote_ref, lock_key)
-                except Exception as e:
-                    logger.info(f"failed to release lock {lock_key} for {remote_ref}: {e}")
-                    # Returning here would discard an exception in flight --
-                    # a SIGTERM's included, leaving a helper that has already
-                    # stopped listening for the signal running on.
-                    if not unwinding:
-                        return f'error {remote_ref} "failed to release lock. You may need to manually remove the lock {lock_key} from the server or use git-s3 doctor to fix."?\n'
+            # A SIGTERM landing here would stop the cleanup it exists to run.
+            with termination_deferred():
+                # First, so a lock release that fails below cannot skip it.
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                if lock_key:
+                    try:
+                        self.release_lock(remote_ref, lock_key)
+                    except Exception as e:
+                        logger.info(f"failed to release lock {lock_key} for {remote_ref}: {e}")
+                        # Returning here would discard an exception in flight --
+                        # a SIGTERM's included, leaving a helper that has already
+                        # stopped listening for the signal running on.
+                        if not unwinding:
+                            return f'error {remote_ref} "failed to release lock. You may need to manually remove the lock {lock_key} from the server or use git-s3 doctor to fix."?\n'
 
     def _retire_previous_bundle(
         self, remote_ref: str, remote_to_remove: Optional[str]

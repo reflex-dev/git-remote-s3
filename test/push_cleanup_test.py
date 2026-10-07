@@ -445,3 +445,54 @@ def test_an_unreachable_lock_check_during_termination_still_terminates(
     with patch.object(s3_remote, "acquire_lock", side_effect=Terminated()):
         with pytest.raises(Terminated):
             s3_remote.cmd_push(f"push {BRANCH}:{BRANCH}")
+
+
+@patch("git_remote_s3.git.rev_parse", return_value=SHA)
+@patch("git_remote_s3.git.bundle", side_effect=_bundle_into)
+@patch("boto3.Session.client")
+def test_a_sigterm_during_cleanup_still_releases_the_lock(
+    client, bundle, rev_parse, temp_root
+):
+    """The push succeeded; the first signal lands in its `finally`."""
+    import shutil
+
+    from git_remote_s3.remote import _raise_terminated
+
+    real_rmtree = shutil.rmtree
+
+    def rmtree_signalled(path, **kwargs):
+        _raise_terminated(signal.SIGTERM, None)
+        real_rmtree(path, **kwargs)
+
+    previous = signal.getsignal(signal.SIGTERM)
+    try:
+        with patch("git_remote_s3.remote.shutil.rmtree", rmtree_signalled):
+            with pytest.raises(Terminated):
+                _remote(client).cmd_push(f"push {BRANCH}:{BRANCH}")
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+    released = [
+        c.kwargs["Key"]
+        for c in client.return_value.delete_object.call_args_list
+        if c.kwargs["Key"].endswith("LOCK#.lock")
+    ]
+    assert released == [f"test_prefix/{BRANCH}/LOCK#.lock"]
+    assert _push_dirs(temp_root) == []
+
+
+def test_a_nested_deferral_holds_until_the_outermost_block_ends():
+    from git_remote_s3.remote import _raise_terminated, termination_deferred
+
+    previous = signal.getsignal(signal.SIGTERM)
+    reached = []
+    try:
+        with pytest.raises(Terminated):
+            with termination_deferred():
+                with termination_deferred():
+                    _raise_terminated(signal.SIGTERM, None)
+                reached.append("after inner block")
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+    assert reached == ["after inner block"]
