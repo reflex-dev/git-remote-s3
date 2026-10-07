@@ -307,17 +307,24 @@ class S3Remote:
             if current_remote_to_remove != remote_to_remove:
                 return f'error {remote_ref} "stale remote. Please fetch and retry."?\n'
 
-            self.s3.upload_file(
-                Filename=temp_file,
-                Bucket=self.bucket,
-                Key=f"{self.prefix}/{remote_ref}/{sha}.bundle",
-                Config=transfer_config(),
-            )
+            bundle_key = f"{self.prefix}/{remote_ref}/{sha}.bundle"
+            try:
+                self.s3.upload_file(
+                    Filename=temp_file,
+                    Bucket=self.bucket,
+                    Key=bundle_key,
+                    Config=transfer_config(),
+                )
+            except Terminated:
+                # The transfer finishes the requests it has already sent before
+                # it unwinds, so a multipart upload interrupted near its end
+                # still lands. Left there, it sits beside the old bundle.
+                if self._object_exists(bundle_key):
+                    self._retire_previous_bundle(remote_ref, remote_to_remove)
+                raise
 
             with termination_deferred():
-                if remote_to_remove:
-                    self.s3.delete_object(Bucket=self.bucket, Key=remote_to_remove)
-                self.init_remote_head(remote_ref)
+                self._retire_previous_bundle(remote_ref, remote_to_remove)
             logger.info(f"pushed {temp_file} to {remote_ref}")
 
             if self.uri_scheme == UriScheme.S3_ZIP:
@@ -364,6 +371,21 @@ class S3Remote:
                 except Exception as e:
                     logger.info(f"failed to release lock {lock_key} for {remote_ref}: {e}")
                     return f'error {remote_ref} "failed to release lock. You may need to manually remove the lock {lock_key} from the server or use git-s3 doctor to fix."?\n'
+
+    def _retire_previous_bundle(
+        self, remote_ref: str, remote_to_remove: Optional[str]
+    ) -> None:
+        """Finish a push whose bundle has landed: drop the bundle it replaced."""
+        if remote_to_remove:
+            self.s3.delete_object(Bucket=self.bucket, Key=remote_to_remove)
+        self.init_remote_head(remote_ref)
+
+    def _object_exists(self, key: str) -> bool:
+        try:
+            self.s3.head_object(Bucket=self.bucket, Key=key)
+        except ClientError:
+            return False
+        return True
 
     def init_remote_head(self, ref: str) -> None:
         """Initialise the remote HEAD reference if it does not exist

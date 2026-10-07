@@ -199,3 +199,65 @@ def test_a_sigterm_after_the_upload_still_deletes_the_old_bundle(
     assert old["Key"] in deleted
     assert any(key.endswith("LOCK#.lock") for key in deleted)
     assert _push_dirs(temp_root) == []
+
+
+def _killed_mid_upload(client, landed):
+    """An upload interrupted by SIGTERM, whose last request did or did not land."""
+    import botocore.exceptions
+
+    old = {"Key": f"test_prefix/{BRANCH}/{'d' * 40}.bundle"}
+    client.return_value.list_objects_v2.return_value = {"Contents": [old]}
+    client.return_value.upload_file.side_effect = Terminated()
+    if not landed:
+        client.return_value.head_object.side_effect = botocore.exceptions.ClientError(
+            {"Error": {"Code": "404"}}, "head_object"
+        )
+    return old
+
+
+def _bundle_deletes(client):
+    return [
+        c.kwargs["Key"]
+        for c in client.return_value.delete_object.call_args_list
+        if c.kwargs["Key"].endswith(".bundle")
+    ]
+
+
+@patch("git_remote_s3.git.is_ancestor", return_value=True)
+@patch("git_remote_s3.git.rev_parse", return_value=SHA)
+@patch("git_remote_s3.git.bundle", side_effect=_bundle_into)
+@patch("boto3.Session.client")
+def test_an_upload_that_lands_after_the_kill_still_replaces_the_old_bundle(
+    client, bundle, rev_parse, is_ancestor, temp_root
+):
+    """The transfer finishes requests it already sent, so a kill can lose the race.
+
+    A local kill sweep left two bundles under main at most kill times between
+    8.4s and 9.2s of a 440 MB push before this.
+    """
+    old = _killed_mid_upload(client, landed=True)
+
+    with pytest.raises(Terminated):
+        S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix").cmd_push(
+            f"push {BRANCH}:{BRANCH}"
+        )
+
+    assert _bundle_deletes(client) == [old["Key"]]
+    assert _push_dirs(temp_root) == []
+
+
+@patch("git_remote_s3.git.is_ancestor", return_value=True)
+@patch("git_remote_s3.git.rev_parse", return_value=SHA)
+@patch("git_remote_s3.git.bundle", side_effect=_bundle_into)
+@patch("boto3.Session.client")
+def test_an_upload_that_never_landed_keeps_the_old_bundle(
+    client, bundle, rev_parse, is_ancestor, temp_root
+):
+    _killed_mid_upload(client, landed=False)
+
+    with pytest.raises(Terminated):
+        S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix").cmd_push(
+            f"push {BRANCH}:{BRANCH}"
+        )
+
+    assert _bundle_deletes(client) == []
