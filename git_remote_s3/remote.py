@@ -15,7 +15,10 @@ from botocore.exceptions import (
     UnknownCredentialError,
 )
 from boto3.s3.transfer import TransferConfig
+import contextlib
 import re
+import shutil
+import signal
 import tempfile
 import os
 import concurrent.futures
@@ -44,6 +47,79 @@ if "remote" in __name__:
     )
 
 DEFAULT_LOCK_TTL_SECONDS = 60
+
+MB = 1024**2
+
+
+def transfer_config() -> TransferConfig:
+    """Multipart, parallel transfers for bundles, which hold a ref's whole history.
+
+    Multipart Threshold (25 MB):
+    - Small enough to ensure multi-part transfers are used when necessary
+    - Allows parallel transfer to begin early
+    Chunk Size (16 MB):
+    - Large enough to minimize HTTP request overhead
+    - Small enough to allow good parallelization (500 MB file = ~31 chunks)
+    """
+    return TransferConfig(
+        multipart_threshold=25 * MB,
+        multipart_chunksize=16 * MB,
+        use_threads=True,
+        max_concurrency=8,
+    )
+
+
+class Terminated(BaseException):
+    """SIGTERM, raised so `finally` blocks run.
+
+    Python's default SIGTERM disposition ends the process on the spot, and a
+    push killed that way leaves its bundle -- a copy of the ref's whole history
+    -- in the temp dir and its lock on the server. `timeout(1)` sends SIGTERM to
+    the whole process group, so a push that outlives its caller's budget is
+    exactly the one this reaches. A BaseException so no `except Exception`
+    between here and `main` mistakes it for a push error.
+    """
+
+
+class _Termination:
+    """Whether SIGTERM may raise now, or has to wait for a step to finish."""
+
+    deferred = False
+    pending = False
+
+
+def _raise_terminated(signum, frame):
+    # One cleanup at a time: a second SIGTERM would interrupt the `finally`
+    # this one is unwinding through.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    if _Termination.deferred:
+        _Termination.pending = True
+        return
+    raise Terminated()
+
+
+@contextlib.contextmanager
+def termination_deferred():
+    """Hold a SIGTERM until the block finishes, then raise it.
+
+    For the steps after a new bundle has landed: stopping between the upload
+    and the old bundle's delete leaves the ref holding both, and every later
+    push and fetch refuses it as "matches more than one". Both are single
+    requests, so finishing them costs the caller little of what it gave up.
+    """
+    _Termination.deferred = True
+    try:
+        yield
+    finally:
+        _Termination.deferred = False
+        if _Termination.pending:
+            _Termination.pending = False
+            raise Terminated()
+
+
+def _protocol_message(text: str) -> str:
+    """Fold text onto one line that can sit inside a quoted helper response."""
+    return " ".join(text.split()).replace('"', "'")
 
 class BucketNotFoundError(Exception):
     def __init__(self, bucket: str):
@@ -130,30 +206,11 @@ class S3Remote:
             temp_dir = tempfile.mkdtemp(prefix="git_remote_s3_fetch_")
             bundle_path = f"{temp_dir}/{sha}.bundle"
 
-            # Use TransferConfig for multipart download
-            # Multipart Threshold (64 MB):
-            # - Small enough to ensure multi-part downloads are used when necessary
-            # - Allows parallel downloading to begin early
-            # - Good balance between overhead and parallelization benefits
-            # Chunk Size (16 MB):
-            # - Large enough to minimize HTTP request overhead
-            # - Small enough to allow good parallelization (500 MB file = ~31 chunks)
-            # - Provides reasonable progress granularity for monitoring
-            # - Works well with typical network conditions
-            MB = 1024**2
-            config = TransferConfig(
-                multipart_threshold=25 * MB,  # 25MB threshold for multipart
-                multipart_chunksize=16 * MB,  # Size of each part
-                use_threads=True,  # Enable threading
-                max_concurrency=8,  # Number of concurrent threads
-            )
-
-            # Download file using the TransferConfig
             self.s3.download_file(
                 Bucket=self.bucket,
                 Key=f"{self.prefix}/{ref}/{sha}.bundle",
                 Filename=bundle_path,
-                Config=config,
+                Config=transfer_config(),
             )
 
             logger.info(f"fetched {bundle_path} {ref}")
@@ -167,8 +224,7 @@ class S3Remote:
             raise e
         finally:
             if temp_dir is not None:
-                if os.path.exists(f"{temp_dir}/{sha}.bundle"):
-                    os.remove(f"{temp_dir}/{sha}.bundle")
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     def remove_remote_ref(self, remote_ref: str) -> str:
         logger.info(f"Removing remote ref {remote_ref}")
@@ -207,7 +263,6 @@ class S3Remote:
             local_ref = local_ref[1:]
 
         logger.info(f"push !{local_ref}! !{remote_ref}!")
-        temp_dir = tempfile.mkdtemp(prefix="git_remote_s3_push_")
 
         contents = self.get_bundles_for_ref(remote_ref)
         if len(contents) > 1:
@@ -216,6 +271,7 @@ class S3Remote:
         remote_to_remove = contents[0]["Key"] if len(contents) == 1 else None
         sha: Optional[str] = None
         lock_key: Optional[str] = None
+        temp_dir = tempfile.mkdtemp(prefix="git_remote_s3_push_")
         try:
             sha = git.rev_parse(local_ref)
             if remote_to_remove:
@@ -248,24 +304,25 @@ class S3Remote:
             current_remote_to_remove = (
                 current_contents[0]["Key"] if len(current_contents) == 1 else None
             )
-            if (
-                remote_to_remove is not None
-                and current_remote_to_remove is not None
-                and current_remote_to_remove != remote_to_remove
-            ):
+            # Compared whole, None included: a ref that had no bundle when this
+            # push looked, and has one now, was created by another writer, and
+            # uploading beside it -- with nothing to delete -- leaves the ref
+            # holding two bundles, which every later push and fetch refuses.
+            if current_remote_to_remove != remote_to_remove:
                 return f'error {remote_ref} "stale remote. Please fetch and retry."?\n'
 
-            with open(temp_file, "rb") as f:
-                self.s3.put_object(
-                    Bucket=self.bucket,
-                    Key=f"{self.prefix}/{remote_ref}/{sha}.bundle",
-                    Body=f,
-                )
+            self.s3.upload_file(
+                Filename=temp_file,
+                Bucket=self.bucket,
+                Key=f"{self.prefix}/{remote_ref}/{sha}.bundle",
+                Config=transfer_config(),
+            )
 
-            self.init_remote_head(remote_ref)
+            with termination_deferred():
+                if remote_to_remove:
+                    self.s3.delete_object(Bucket=self.bucket, Key=remote_to_remove)
+                self.init_remote_head(remote_ref)
             logger.info(f"pushed {temp_file} to {remote_ref}")
-            if remote_to_remove:
-                self.s3.delete_object(Bucket=self.bucket, Key=remote_to_remove)
 
             if self.uri_scheme == UriScheme.S3_ZIP:
                 # Create and push a zip archive next to the bundle file
@@ -286,6 +343,13 @@ class S3Remote:
                 )
 
             return f"ok {remote_ref}\n"
+        except git.BundleError as e:
+            # Written at error level so it reaches stderr at any verbosity:
+            # git's reason (a full disk, most often) is what tells the caller
+            # whether retrying can help.
+            logger.error(f"git bundle create failed for {local_ref}: {e}")
+            reason = _protocol_message(f"bundle failed: {e}")
+            return f'error {remote_ref} "{reason}"?\n'
         except git.GitError:
             logger.info(f"fatal: {local_ref} not found\n")
             return f'error {remote_ref} "{local_ref} not found"?\n'
@@ -296,14 +360,14 @@ class S3Remote:
             logger.info(f"fatal: {e}\n")
             return f'error {remote_ref} "{e}"?\n'
         finally:
+            # First, so a lock release that fails below cannot skip it.
+            shutil.rmtree(temp_dir, ignore_errors=True)
             if lock_key:
                 try:
                     self.release_lock(remote_ref, lock_key)
                 except Exception as e:
                     logger.info(f"failed to release lock {lock_key} for {remote_ref}: {e}")
                     return f'error {remote_ref} "failed to release lock. You may need to manually remove the lock {lock_key} from the server or use git-s3 doctor to fix."?\n'
-            if sha and os.path.exists(f"{temp_dir}/{sha}.bundle"):
-                os.remove(f"{temp_dir}/{sha}.bundle")
 
     def init_remote_head(self, ref: str) -> None:
         """Initialise the remote HEAD reference if it does not exist
@@ -555,6 +619,7 @@ class S3Remote:
 
 
 def main():
+    signal.signal(signal.SIGTERM, _raise_terminated)
     logger.info(sys.argv)
     remote = sys.argv[2]
     uri_scheme, profile, bucket, prefix = parse_git_url(remote)
@@ -574,6 +639,9 @@ def main():
             logger.info(f"cmd: {line}")
             s3remote.process_cmd(line)
 
+    except Terminated:
+        logger.info("terminated")
+        sys.exit(128 + signal.SIGTERM)
     except BrokenPipeError:
         logger.info("BrokenPipeError")
         devnull = os.open(os.devnull, os.O_WRONLY)

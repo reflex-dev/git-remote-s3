@@ -11,6 +11,10 @@ class GitError(Exception):
     pass
 
 
+class BundleError(GitError):
+    """`git bundle create` failed; the message is git's own stderr."""
+
+
 def archive(*, folder: str, ref: str) -> str:
     """Archive the content of the folder into a repo.zip file
 
@@ -48,17 +52,18 @@ def bundle(*, folder: str, sha: str, ref: str) -> str:
         str: the path to the bundle file
     """
     file_path = f"{folder}/{sha}.bundle"
+    # Not check=True: a CalledProcessError carries only the exit status, so the
+    # reason git gave -- a full disk, most often -- never reached the caller.
     result = subprocess.run(
         ["git", "bundle", "create", file_path, ref],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        check=True,
     )
 
     if result.returncode == 0:
         return file_path
     else:
-        raise GitError(result.stderr.decode("utf8"))
+        raise BundleError(result.stderr.decode("utf8", errors="replace"))
 
 
 def unbundle(*, folder: str, sha: str, ref: str):
