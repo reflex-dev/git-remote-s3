@@ -14,14 +14,16 @@ requires-python = ">= 3.10"
 dependencies = [
     "boto3 (>=1.42.24,<2.0.0)",
     "botocore (>=1.42.24,<2.0.0)",
-    "urllib3 (>=2.6.3,<3.0.0)"
+    "urllib3 (>=2.7.0,<3.0.0)"
 ]
 
 [project.scripts]
 git-remote-s3 = "git_remote_s3.remote:main"
-"git-remote-s3+zip" = "git_remote_s3.remote:main"
 git-lfs-s3 = "git_remote_s3.lfs:main"
 git-s3 = "git_remote_s3.manage:main"
+
+[tool.poetry.scripts]
+"git-remote-s3+zip" = { reference = "scripts/git-remote-s3+zip", type = "file" }
 
 
 
@@ -29,7 +31,7 @@ git-s3 = "git_remote_s3.manage:main"
 flake8 = "^7.1.1"
 flake8-bugbear = "^24.4.26"
 mypy = "^1.11.1"
-pytest = "^8.3.2"
+pytest = "^9.0.3"
 mock = "^5.1.0"
 black = "^26.3.1"
 coverage = "^7.6.1"
