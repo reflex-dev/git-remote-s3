@@ -123,6 +123,32 @@ def termination_deferred():
             raise Terminated()
 
 
+@contextlib.contextmanager
+def _still_terminating(terminated: Terminated):
+    """Best-effort cleanup on the way out of a killed push.
+
+    A failure here must not replace the termination: the push's own handlers
+    would turn it into an ordinary error line, and the helper -- which has
+    stopped listening for SIGTERM -- would go on to the next command.
+    """
+    try:
+        yield
+    except Exception as e:
+        logger.info(f"cleanup after termination failed: {e}")
+        raise terminated from e
+
+
+_NOT_FOUND_CODES = ("404", "NoSuchKey", "NotFound")
+
+
+def _is_not_found(error: ClientError) -> bool:
+    """Whether S3 answered that the object is not there."""
+    response = error.response
+    code = response.get("Error", {}).get("Code")
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return code in _NOT_FOUND_CODES or status == 404
+
+
 def _protocol_message(text: str) -> str:
     """Fold text onto one line that can sit inside a quoted helper response."""
     return " ".join(text.split()).replace('"', "'")
@@ -301,10 +327,11 @@ class S3Remote:
             # Acquire per-ref lock to avoid concurrent writes
             try:
                 lock_key = self.acquire_lock(remote_ref)
-            except Terminated:
+            except Terminated as terminated:
                 # S3 may have created the lock before the signal landed, with
                 # lock_key never assigned; its token says whether it is ours.
-                self._release_lock_if_ours(remote_ref)
+                with _still_terminating(terminated):
+                    self._release_lock_if_ours(remote_ref)
                 raise
             if not lock_key:
                 # Provide clear guidance to the user; include lock path and TTL
@@ -341,14 +368,15 @@ class S3Remote:
                 with termination_deferred():
                     self._retire_previous_bundle(remote_ref, remote_to_remove)
                     retired = True
-            except Terminated:
+            except Terminated as terminated:
                 # The transfer finishes the requests it has already sent before
                 # it unwinds, so a multipart upload interrupted near its end
                 # still lands -- as does one whose signal arrives between the
                 # upload returning and the deferral starting. Left there, it
                 # sits beside the old bundle.
-                if not retired and self._bundle_landed(bundle_key):
-                    self._retire_previous_bundle(remote_ref, remote_to_remove)
+                with _still_terminating(terminated):
+                    if not retired and self._bundle_landed(bundle_key):
+                        self._retire_previous_bundle(remote_ref, remote_to_remove)
                 raise
             logger.info(f"pushed {temp_file} to {remote_ref}")
 
@@ -426,9 +454,7 @@ class S3Remote:
                 self.s3.head_object(Bucket=self.bucket, Key=key)
                 return True
             except ClientError as e:
-                code = e.response.get("Error", {}).get("Code")
-                status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-                if code in ("404", "NoSuchKey", "NotFound") or status == 404:
+                if _is_not_found(e):
                     return False
                 logger.info(f"could not tell whether {key} landed: {e}")
                 if attempt + 1 < _LANDED_CHECK_ATTEMPTS:

@@ -378,3 +378,61 @@ def test_a_check_that_never_answers_keeps_the_old_bundle(client, sleep):
 
     assert s3_remote._bundle_landed("key") is False
     assert client.return_value.head_object.call_count == 3
+
+
+@patch("git_remote_s3.git.is_ancestor", return_value=True)
+@patch("git_remote_s3.git.rev_parse", return_value=SHA)
+@patch("git_remote_s3.git.bundle", side_effect=_bundle_into)
+@patch("boto3.Session.client")
+def test_a_failing_retire_during_termination_still_terminates(
+    client, bundle, rev_parse, is_ancestor, temp_root
+):
+    """SIGTERM lands during the deferred delete, and the delete keeps failing.
+
+    The retry in the recovery path raised ClientError, which cmd_push answered
+    as an ordinary push error -- leaving a helper that ignores SIGTERM to run
+    the next command.
+    """
+    from git_remote_s3.remote import _raise_terminated
+
+    old = {"Key": f"test_prefix/{BRANCH}/{'d' * 40}.bundle"}
+    client.return_value.list_objects_v2.return_value = {"Contents": [old]}
+
+    signalled = []
+
+    def delete_object(Bucket, Key):
+        if Key == old["Key"]:
+            # The signal arrives once, during the first attempt; the retry in
+            # the recovery path then fails on its own.
+            if not signalled:
+                signalled.append(True)
+                _raise_terminated(signal.SIGTERM, None)
+            raise _client_error("InternalError", 500)
+
+    client.return_value.delete_object.side_effect = delete_object
+    previous = signal.getsignal(signal.SIGTERM)
+    try:
+        with pytest.raises(Terminated):
+            S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix").cmd_push(
+                f"push {BRANCH}:{BRANCH}"
+            )
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+@patch("git_remote_s3.git.rev_parse", return_value=SHA)
+@patch("git_remote_s3.git.bundle", side_effect=_bundle_into)
+@patch("boto3.Session.client")
+def test_an_unreachable_lock_check_during_termination_still_terminates(
+    client, bundle, rev_parse, temp_root
+):
+    import botocore.exceptions
+
+    s3_remote = _remote(client)
+    client.return_value.get_object.side_effect = (
+        botocore.exceptions.EndpointConnectionError(endpoint_url="https://s3")
+    )
+
+    with patch.object(s3_remote, "acquire_lock", side_effect=Terminated()):
+        with pytest.raises(Terminated):
+            s3_remote.cmd_push(f"push {BRANCH}:{BRANCH}")
