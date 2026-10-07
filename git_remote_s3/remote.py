@@ -397,8 +397,13 @@ class S3Remote:
                         now = datetime.datetime.now(tz=last_modified.tzinfo)
                         age = (now - last_modified).total_seconds()
                         if age > self.lock_ttl_seconds:
-                            # Attempt to delete stale lock and re-acquire
-                            self.s3.delete_object(Bucket=self.bucket, Key=lock_key)
+                            # Delete only the lock we observed, so a lock written
+                            # since by another client is not removed.
+                            self.s3.delete_object(
+                                Bucket=self.bucket,
+                                Key=lock_key,
+                                IfMatch=head["ETag"],
+                            )
                             # Retry conditional put
                             self.s3.put_object(
                                 Bucket=self.bucket,
