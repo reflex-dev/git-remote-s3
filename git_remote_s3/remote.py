@@ -20,6 +20,7 @@ import re
 import shutil
 import signal
 import tempfile
+import time
 import os
 import concurrent.futures
 from threading import Lock
@@ -47,6 +48,11 @@ if "remote" in __name__:
     )
 
 DEFAULT_LOCK_TTL_SECONDS = 60
+
+# How hard a killed push tries to learn whether its upload landed. It runs
+# after the caller has given up on the push, so it is kept short.
+_LANDED_CHECK_ATTEMPTS = 3
+_LANDED_CHECK_BACKOFF_SECONDS = 0.25
 
 MB = 1024**2
 
@@ -172,6 +178,15 @@ class S3Remote:
             self.lock_ttl_seconds = int(os.environ.get("GIT_REMOTE_S3_LOCK_TTL_SECONDS", DEFAULT_LOCK_TTL_SECONDS))
         except ValueError:
             self.lock_ttl_seconds = DEFAULT_LOCK_TTL_SECONDS
+        # Identifies this helper's lock PUTs, so a 412 caused by boto3 retrying
+        # our own successful write can be recognised and claimed, and a lock a
+        # SIGTERM caught mid-acquire can be released. Set
+        # GIT_REMOTE_S3_OWNER_TOKEN to a stable per-client value to also
+        # recover locks leaked by a previous invocation of this helper.
+        self.lock_token = (
+            os.environ.get("GIT_REMOTE_S3_OWNER_TOKEN", "").encode()
+            or uuid.uuid4().hex.encode()
+        )
 
     def list_refs(self, *, bucket: str, prefix: str) -> list:
         res = self.s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
@@ -271,6 +286,7 @@ class S3Remote:
         remote_to_remove = contents[0]["Key"] if len(contents) == 1 else None
         sha: Optional[str] = None
         lock_key: Optional[str] = None
+        unwinding = False
         temp_dir = tempfile.mkdtemp(prefix="git_remote_s3_push_")
         try:
             sha = git.rev_parse(local_ref)
@@ -283,7 +299,13 @@ class S3Remote:
             temp_file = git.bundle(folder=temp_dir, sha=sha, ref=local_ref)
 
             # Acquire per-ref lock to avoid concurrent writes
-            lock_key = self.acquire_lock(remote_ref)
+            try:
+                lock_key = self.acquire_lock(remote_ref)
+            except Terminated:
+                # S3 may have created the lock before the signal landed, with
+                # lock_key never assigned; its token says whether it is ours.
+                self._release_lock_if_ours(remote_ref)
+                raise
             if not lock_key:
                 # Provide clear guidance to the user; include lock path and TTL
                 lock_path = f"{self.prefix}/{remote_ref}/LOCK#.lock"
@@ -308,6 +330,7 @@ class S3Remote:
                 return f'error {remote_ref} "stale remote. Please fetch and retry."?\n'
 
             bundle_key = f"{self.prefix}/{remote_ref}/{sha}.bundle"
+            retired = False
             try:
                 self.s3.upload_file(
                     Filename=temp_file,
@@ -315,16 +338,18 @@ class S3Remote:
                     Key=bundle_key,
                     Config=transfer_config(),
                 )
+                with termination_deferred():
+                    self._retire_previous_bundle(remote_ref, remote_to_remove)
+                    retired = True
             except Terminated:
                 # The transfer finishes the requests it has already sent before
                 # it unwinds, so a multipart upload interrupted near its end
-                # still lands. Left there, it sits beside the old bundle.
-                if self._object_exists(bundle_key):
+                # still lands -- as does one whose signal arrives between the
+                # upload returning and the deferral starting. Left there, it
+                # sits beside the old bundle.
+                if not retired and self._bundle_landed(bundle_key):
                     self._retire_previous_bundle(remote_ref, remote_to_remove)
                 raise
-
-            with termination_deferred():
-                self._retire_previous_bundle(remote_ref, remote_to_remove)
             logger.info(f"pushed {temp_file} to {remote_ref}")
 
             if self.uri_scheme == UriScheme.S3_ZIP:
@@ -362,6 +387,9 @@ class S3Remote:
         except botocore.exceptions.ClientError as e:
             logger.info(f"fatal: {e}\n")
             return f'error {remote_ref} "{e}"?\n'
+        except BaseException:
+            unwinding = True
+            raise
         finally:
             # First, so a lock release that fails below cannot skip it.
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -370,7 +398,11 @@ class S3Remote:
                     self.release_lock(remote_ref, lock_key)
                 except Exception as e:
                     logger.info(f"failed to release lock {lock_key} for {remote_ref}: {e}")
-                    return f'error {remote_ref} "failed to release lock. You may need to manually remove the lock {lock_key} from the server or use git-s3 doctor to fix."?\n'
+                    # Returning here would discard an exception in flight --
+                    # a SIGTERM's included, leaving a helper that has already
+                    # stopped listening for the signal running on.
+                    if not unwinding:
+                        return f'error {remote_ref} "failed to release lock. You may need to manually remove the lock {lock_key} from the server or use git-s3 doctor to fix."?\n'
 
     def _retire_previous_bundle(
         self, remote_ref: str, remote_to_remove: Optional[str]
@@ -380,12 +412,41 @@ class S3Remote:
             self.s3.delete_object(Bucket=self.bucket, Key=remote_to_remove)
         self.init_remote_head(remote_ref)
 
-    def _object_exists(self, key: str) -> bool:
+    def _bundle_landed(self, key: str) -> bool:
+        """Whether an interrupted upload's bundle is on the server.
+
+        Only "not found" is an answer of no. Anything else that persists is
+        reported as not landed too, which keeps the old bundle: two bundles
+        are a state `git-s3 doctor` and the next push can repair, where
+        deleting the old one for an upload that never landed leaves the ref
+        with none.
+        """
+        for attempt in range(_LANDED_CHECK_ATTEMPTS):
+            try:
+                self.s3.head_object(Bucket=self.bucket, Key=key)
+                return True
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code")
+                status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                if code in ("404", "NoSuchKey", "NotFound") or status == 404:
+                    return False
+                logger.info(f"could not tell whether {key} landed: {e}")
+                if attempt + 1 < _LANDED_CHECK_ATTEMPTS:
+                    time.sleep(_LANDED_CHECK_BACKOFF_SECONDS * (attempt + 1))
+        return False
+
+    def _lock_key(self, remote_ref: str) -> str:
+        return f"{self.prefix}/{remote_ref}/LOCK#.lock"
+
+    def _release_lock_if_ours(self, remote_ref: str) -> None:
+        """Release the ref's lock if this helper's token is the one holding it."""
+        lock_key = self._lock_key(remote_ref)
         try:
-            self.s3.head_object(Bucket=self.bucket, Key=key)
-        except ClientError:
-            return False
-        return True
+            obj = self.s3.get_object(Bucket=self.bucket, Key=lock_key)
+            if obj["Body"].read() == self.lock_token:
+                self.release_lock(remote_ref, lock_key)
+        except ClientError as e:
+            logger.info(f"could not check {lock_key} for {remote_ref}: {e}")
 
     def init_remote_head(self, ref: str) -> None:
         """Initialise the remote HEAD reference if it does not exist
@@ -444,15 +505,8 @@ class S3Remote:
         Returns the lock key if acquired, or None otherwise.
         """
 
-        lock_key = f"{self.prefix}/{remote_ref}/LOCK#.lock"
-        # Identifies our PUT so a 412 caused by boto3 retrying our own
-        # successful write can be recognised and claimed. Set
-        # GIT_REMOTE_S3_OWNER_TOKEN to a stable per-client value to also
-        # recover locks leaked by a previous invocation of this helper.
-        token = (
-            os.environ.get("GIT_REMOTE_S3_OWNER_TOKEN", "").encode()
-            or uuid.uuid4().hex.encode()
-        )
+        lock_key = self._lock_key(remote_ref)
+        token = self.lock_token
         try:
             # Use conditional write to create the lock only if it does not exist
             self.s3.put_object(

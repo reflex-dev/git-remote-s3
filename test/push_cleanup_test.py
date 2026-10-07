@@ -1,5 +1,6 @@
 """A push leaves nothing behind however it ends, and says why it failed."""
 
+import io
 import os
 import signal
 import subprocess
@@ -157,12 +158,19 @@ def test_sigterm_runs_finally_blocks(tmp_path):
             os.remove({str(marker)!r})
         """)
     proc = subprocess.Popen([sys.executable, "-c", script])
-    deadline = time.monotonic() + 10
-    while not ready.exists() and time.monotonic() < deadline:
-        time.sleep(0.05)
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        # Otherwise the marker's absence would say nothing about the handler.
+        assert ready.exists() and marker.exists()
 
-    proc.send_signal(signal.SIGTERM)
-    proc.wait(timeout=10)
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=10)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
 
     assert not marker.exists()
 
@@ -261,3 +269,112 @@ def test_an_upload_that_never_landed_keeps_the_old_bundle(
         )
 
     assert _bundle_deletes(client) == []
+
+
+def _client_error(code, status):
+    import botocore.exceptions
+
+    return botocore.exceptions.ClientError(
+        {"Error": {"Code": code}, "ResponseMetadata": {"HTTPStatusCode": status}},
+        "op",
+    )
+
+
+@patch("git_remote_s3.git.is_ancestor", return_value=True)
+@patch("git_remote_s3.git.rev_parse", return_value=SHA)
+@patch("git_remote_s3.git.bundle", side_effect=_bundle_into)
+@patch("boto3.Session.client")
+def test_a_sigterm_between_the_upload_and_the_deferral_still_replaces_the_old_bundle(
+    client, bundle, rev_parse, is_ancestor, temp_root
+):
+    """The upload has returned; the signal lands before the deferral starts."""
+    import contextlib
+
+    old = {"Key": f"test_prefix/{BRANCH}/{'d' * 40}.bundle"}
+    client.return_value.list_objects_v2.return_value = {"Contents": [old]}
+
+    @contextlib.contextmanager
+    def signalled_on_entry():
+        raise Terminated()
+        yield
+
+    with patch("git_remote_s3.remote.termination_deferred", signalled_on_entry):
+        with pytest.raises(Terminated):
+            S3Remote(UriScheme.S3, None, "test_bucket", "test_prefix").cmd_push(
+                f"push {BRANCH}:{BRANCH}"
+            )
+
+    assert _bundle_deletes(client) == [old["Key"]]
+
+
+@patch("git_remote_s3.git.rev_parse", return_value=SHA)
+@patch("git_remote_s3.git.bundle", side_effect=_bundle_into)
+@patch("boto3.Session.client")
+def test_a_lock_created_as_the_signal_landed_is_released(
+    client, bundle, rev_parse, temp_root
+):
+    s3_remote = _remote(client)
+    client.return_value.get_object.return_value = {
+        "Body": io.BytesIO(s3_remote.lock_token)
+    }
+
+    with patch.object(s3_remote, "acquire_lock", side_effect=Terminated()):
+        with pytest.raises(Terminated):
+            s3_remote.cmd_push(f"push {BRANCH}:{BRANCH}")
+
+    released = [
+        c.kwargs["Key"]
+        for c in client.return_value.delete_object.call_args_list
+        if c.kwargs["Key"].endswith("LOCK#.lock")
+    ]
+    assert released == [f"test_prefix/{BRANCH}/LOCK#.lock"]
+
+
+@patch("git_remote_s3.git.rev_parse", return_value=SHA)
+@patch("git_remote_s3.git.bundle", side_effect=_bundle_into)
+@patch("boto3.Session.client")
+def test_another_writers_lock_is_not_released(client, bundle, rev_parse, temp_root):
+    s3_remote = _remote(client)
+    client.return_value.get_object.return_value = {"Body": io.BytesIO(b"someone else")}
+
+    with patch.object(s3_remote, "acquire_lock", side_effect=Terminated()):
+        with pytest.raises(Terminated):
+            s3_remote.cmd_push(f"push {BRANCH}:{BRANCH}")
+
+    assert client.return_value.delete_object.call_count == 0
+
+
+@patch("git_remote_s3.git.rev_parse", return_value=SHA)
+@patch("git_remote_s3.git.bundle", side_effect=_bundle_into)
+@patch("boto3.Session.client")
+def test_a_failed_lock_release_does_not_swallow_the_termination(
+    client, bundle, rev_parse, temp_root
+):
+    client.return_value.upload_file.side_effect = Terminated()
+    client.return_value.head_object.side_effect = _client_error("404", 404)
+    client.return_value.delete_object.side_effect = _client_error("InternalError", 500)
+
+    with pytest.raises(Terminated):
+        _remote(client).cmd_push(f"push {BRANCH}:{BRANCH}")
+
+
+@patch("git_remote_s3.remote.time.sleep")
+@patch("boto3.Session.client")
+def test_a_check_that_errors_is_retried_before_it_answers(client, sleep):
+    s3_remote = _remote(client)
+    client.return_value.head_object.side_effect = [
+        _client_error("InternalError", 500),
+        {},
+    ]
+
+    assert s3_remote._bundle_landed("key") is True
+
+
+@patch("git_remote_s3.remote.time.sleep")
+@patch("boto3.Session.client")
+def test_a_check_that_never_answers_keeps_the_old_bundle(client, sleep):
+    s3_remote = _remote(client)
+    client.return_value.head_object.side_effect = _client_error("InternalError", 500)
+
+    assert s3_remote._bundle_landed("key") is False
+    assert client.return_value.head_object.call_count == 3
